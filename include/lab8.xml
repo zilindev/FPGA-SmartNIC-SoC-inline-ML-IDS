@@ -1,0 +1,270 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<nf:module xmlns:nf="http://www.NetFPGA.org/NF2_register_system"
+           xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+           xsi:schemaLocation="http://www.NetFPGA.org/NF2_register_system NF2_register_system.xsd">
+	<nf:name>lab8</nf:name>
+	<nf:prefix>lab8</nf:prefix>
+	<nf:location>udp</nf:location>
+	<nf:description>Lab8 Network Processor: convertible FIFO with CPU/GPU integration</nf:description>
+	<nf:blocksize>256</nf:blocksize>
+	<nf:registers>
+		<!-- FIFO control/status -->
+		<nf:register>
+			<nf:name>ctrl</nf:name>
+			<nf:description>System control: bit[0]=soft_reset</nf:description>
+			<nf:type>generic_software32</nf:type>
+		</nf:register>
+		<nf:register>
+			<nf:name>status</nf:name>
+			<nf:description>Status: {pkt_word_cnt[31:24], head[23:16], tail[15:8], 5'b0, empty, full, pkt_ready}</nf:description>
+			<nf:type>generic_hardware32</nf:type>
+		</nf:register>
+		<nf:register>
+			<nf:name>fifo_mode</nf:name>
+			<nf:description>FIFO mode: 0=FIFO, 1=CPU, 2=GPU</nf:description>
+			<nf:type>generic_software32</nf:type>
+		</nf:register>
+		<nf:register>
+			<nf:name>fifo_drain</nf:name>
+			<nf:description>Drain trigger: bit[0]=drain_start (auto-clear)</nf:description>
+			<nf:type>generic_software32</nf:type>
+		</nf:register>
+
+		<!-- FIFO BRAM access via PCI -->
+		<nf:register>
+			<nf:name>bram_addr</nf:name>
+			<nf:description>BRAM address [7:0]</nf:description>
+			<nf:type>generic_software32</nf:type>
+		</nf:register>
+		<nf:register>
+			<nf:name>bram_wd_lo</nf:name>
+			<nf:description>BRAM write data [31:0]</nf:description>
+			<nf:type>generic_software32</nf:type>
+		</nf:register>
+		<nf:register>
+			<nf:name>bram_wd_hi</nf:name>
+			<nf:description>BRAM write data [63:32]</nf:description>
+			<nf:type>generic_software32</nf:type>
+		</nf:register>
+		<nf:register>
+			<nf:name>bram_wctrl</nf:name>
+			<nf:description>BRAM write ctrl [7:0]</nf:description>
+			<nf:type>generic_software32</nf:type>
+		</nf:register>
+		<nf:register>
+			<nf:name>bram_cmd</nf:name>
+			<nf:description>BRAM command: bit[0]=write strobe (auto-clear)</nf:description>
+			<nf:type>generic_software32</nf:type>
+		</nf:register>
+		<nf:register>
+			<nf:name>bram_rd_lo</nf:name>
+			<nf:description>BRAM read data [31:0]</nf:description>
+			<nf:type>generic_hardware32</nf:type>
+		</nf:register>
+		<nf:register>
+			<nf:name>bram_rd_hi</nf:name>
+			<nf:description>BRAM read data [63:32]</nf:description>
+			<nf:type>generic_hardware32</nf:type>
+		</nf:register>
+		<nf:register>
+			<nf:name>bram_rctrl</nf:name>
+			<nf:description>BRAM read ctrl [7:0]</nf:description>
+			<nf:type>generic_hardware32</nf:type>
+		</nf:register>
+
+		<!-- CPU registers (Batch 3) -->
+		<nf:register>
+			<nf:name>cpu_ctrl</nf:name>
+			<nf:description>CPU control: bit[0]=start_stop, bit[1]=cpu_reset</nf:description>
+			<nf:type>generic_software32</nf:type>
+		</nf:register>
+		<nf:register>
+			<nf:name>cpu_status</nf:name>
+			<nf:description>CPU status: {all_halted[31], cpsr_3..0[27:12], thread_id[11:10], running[1], ~reset[0]}</nf:description>
+			<nf:type>generic_hardware32</nf:type>
+		</nf:register>
+		<nf:register>
+			<nf:name>cpu_imem_addr</nf:name>
+			<nf:description>IMEM address [8:0]</nf:description>
+			<nf:type>generic_software32</nf:type>
+		</nf:register>
+		<nf:register>
+			<nf:name>cpu_imem_wdata</nf:name>
+			<nf:description>IMEM write data [31:0]</nf:description>
+			<nf:type>generic_software32</nf:type>
+		</nf:register>
+		<nf:register>
+			<nf:name>cpu_imem_cmd</nf:name>
+			<nf:description>IMEM command: bit[0]=write strobe (auto-clear)</nf:description>
+			<nf:type>generic_software32</nf:type>
+		</nf:register>
+		<nf:register>
+			<nf:name>cpu_imem_rdata</nf:name>
+			<nf:description>IMEM readback [31:0]</nf:description>
+			<nf:type>generic_hardware32</nf:type>
+		</nf:register>
+		<nf:register>
+			<nf:name>cpu_dmem_addr</nf:name>
+			<nf:description>DMEM address [7:0]</nf:description>
+			<nf:type>generic_software32</nf:type>
+		</nf:register>
+		<nf:register>
+			<nf:name>cpu_dmem_wdata_lo</nf:name>
+			<nf:description>DMEM write data [31:0]</nf:description>
+			<nf:type>generic_software32</nf:type>
+		</nf:register>
+		<nf:register>
+			<nf:name>cpu_dmem_wdata_hi</nf:name>
+			<nf:description>DMEM write data [63:32]</nf:description>
+			<nf:type>generic_software32</nf:type>
+		</nf:register>
+		<nf:register>
+			<nf:name>cpu_dmem_cmd</nf:name>
+			<nf:description>DMEM command: bit[0]=write strobe (auto-clear)</nf:description>
+			<nf:type>generic_software32</nf:type>
+		</nf:register>
+		<nf:register>
+			<nf:name>cpu_dmem_rdata_lo</nf:name>
+			<nf:description>DMEM readback [31:0]</nf:description>
+			<nf:type>generic_hardware32</nf:type>
+		</nf:register>
+		<nf:register>
+			<nf:name>cpu_dmem_rdata_hi</nf:name>
+			<nf:description>DMEM readback [63:32]</nf:description>
+			<nf:type>generic_hardware32</nf:type>
+		</nf:register>
+		<nf:register>
+			<nf:name>cpu_la_addr</nf:name>
+			<nf:description>Logic analyzer address [10:0]</nf:description>
+			<nf:type>generic_software32</nf:type>
+		</nf:register>
+		<nf:register>
+			<nf:name>cpu_la_rdata_lo</nf:name>
+			<nf:description>LA readback [31:0]</nf:description>
+			<nf:type>generic_hardware32</nf:type>
+		</nf:register>
+		<nf:register>
+			<nf:name>cpu_la_rdata_hi</nf:name>
+			<nf:description>LA readback [63:32]</nf:description>
+			<nf:type>generic_hardware32</nf:type>
+		</nf:register>
+
+		<!-- Padding (0x1B-0x1F) to align GPU registers at 0x20 -->
+		<nf:register>
+			<nf:name>reserved_1b</nf:name>
+			<nf:description>Reserved</nf:description>
+			<nf:type>generic_software32</nf:type>
+		</nf:register>
+		<nf:register>
+			<nf:name>reserved_1c</nf:name>
+			<nf:description>Reserved</nf:description>
+			<nf:type>generic_software32</nf:type>
+		</nf:register>
+		<nf:register>
+			<nf:name>reserved_1d</nf:name>
+			<nf:description>Reserved</nf:description>
+			<nf:type>generic_software32</nf:type>
+		</nf:register>
+		<nf:register>
+			<nf:name>reserved_1e</nf:name>
+			<nf:description>Reserved</nf:description>
+			<nf:type>generic_software32</nf:type>
+		</nf:register>
+		<nf:register>
+			<nf:name>reserved_1f</nf:name>
+			<nf:description>Reserved</nf:description>
+			<nf:type>generic_software32</nf:type>
+		</nf:register>
+
+		<!-- GPU registers (Batch 4) -->
+		<nf:register>
+			<nf:name>gpu_ctrl</nf:name>
+			<nf:description>GPU control: bit[0]=gpu_reset (1=hold in reset)</nf:description>
+			<nf:type>generic_software32</nf:type>
+		</nf:register>
+		<nf:register>
+			<nf:name>gpu_status</nf:name>
+			<nf:description>GPU status: bit[0]=kernel_done, bit[1]=dma_busy</nf:description>
+			<nf:type>generic_hardware32</nf:type>
+		</nf:register>
+		<nf:register>
+			<nf:name>gpu_imem_addr</nf:name>
+			<nf:description>GPU IMEM address [9:0]</nf:description>
+			<nf:type>generic_software32</nf:type>
+		</nf:register>
+		<nf:register>
+			<nf:name>gpu_imem_wdata</nf:name>
+			<nf:description>GPU IMEM write data [31:0]</nf:description>
+			<nf:type>generic_software32</nf:type>
+		</nf:register>
+		<nf:register>
+			<nf:name>gpu_imem_cmd</nf:name>
+			<nf:description>GPU IMEM command: bit[0]=write strobe (auto-clear)</nf:description>
+			<nf:type>generic_software32</nf:type>
+		</nf:register>
+		<nf:register>
+			<nf:name>gpu_imem_rdata</nf:name>
+			<nf:description>GPU IMEM readback [31:0]</nf:description>
+			<nf:type>generic_hardware32</nf:type>
+		</nf:register>
+		<nf:register>
+			<nf:name>gpu_dmem_addr</nf:name>
+			<nf:description>GPU DMEM address [9:0]</nf:description>
+			<nf:type>generic_software32</nf:type>
+		</nf:register>
+		<nf:register>
+			<nf:name>gpu_dmem_wdata_lo</nf:name>
+			<nf:description>GPU DMEM write data [31:0]</nf:description>
+			<nf:type>generic_software32</nf:type>
+		</nf:register>
+		<nf:register>
+			<nf:name>gpu_dmem_wdata_hi</nf:name>
+			<nf:description>GPU DMEM write data [63:32]</nf:description>
+			<nf:type>generic_software32</nf:type>
+		</nf:register>
+		<nf:register>
+			<nf:name>gpu_dmem_cmd</nf:name>
+			<nf:description>GPU DMEM command: bit[0]=write strobe (auto-clear)</nf:description>
+			<nf:type>generic_software32</nf:type>
+		</nf:register>
+		<nf:register>
+			<nf:name>gpu_dmem_rdata_lo</nf:name>
+			<nf:description>GPU DMEM readback [31:0]</nf:description>
+			<nf:type>generic_hardware32</nf:type>
+		</nf:register>
+		<nf:register>
+			<nf:name>gpu_dmem_rdata_hi</nf:name>
+			<nf:description>GPU DMEM readback [63:32]</nf:description>
+			<nf:type>generic_hardware32</nf:type>
+		</nf:register>
+
+		<!-- DMA registers (Batch 4) -->
+		<nf:register>
+			<nf:name>dma_ctrl</nf:name>
+			<nf:description>DMA control: bit[0]=start (auto-clear), bit[1]=direction (0=FIFO to GPU, 1=GPU to FIFO)</nf:description>
+			<nf:type>generic_software32</nf:type>
+		</nf:register>
+		<nf:register>
+			<nf:name>dma_fifo_addr</nf:name>
+			<nf:description>DMA FIFO BRAM start address [7:0]</nf:description>
+			<nf:type>generic_software32</nf:type>
+		</nf:register>
+		<nf:register>
+			<nf:name>dma_gpu_addr</nf:name>
+			<nf:description>DMA GPU DMEM start address [9:0]</nf:description>
+			<nf:type>generic_software32</nf:type>
+		</nf:register>
+		<nf:register>
+			<nf:name>dma_length</nf:name>
+			<nf:description>DMA word count [7:0]</nf:description>
+			<nf:type>generic_software32</nf:type>
+		</nf:register>
+
+		<!-- GPU performance counter (Lab 10) -->
+		<nf:register>
+			<nf:name>gpu_cycle_count</nf:name>
+			<nf:description>GPU cycle counter: counts core_clk cycles from gpu_reset deassertion until kernel_done</nf:description>
+			<nf:type>generic_hardware32</nf:type>
+		</nf:register>
+	</nf:registers>
+</nf:module>

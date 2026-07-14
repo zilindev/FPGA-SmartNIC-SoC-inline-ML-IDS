@@ -1,0 +1,1074 @@
+#!/usr/bin/perl -w
+use strict;
+
+# ============================================================================
+# lab8reg — Register interface for NetFPGA NF2.1 Lab8
+#
+# Commands: reset, status, mode, drain, fifo_read, fifo_write,
+#           bram_write_full, packet_echo,
+#           cpu_status, cpu_reset, cpu_start, cpu_stop,
+#           cpu_load_imem, cpu_read_imem, cpu_read_dmem, cpu_write_dmem,
+#           cpu_la_read, cpu_test,
+#           gpu_status, gpu_reset, gpu_start, gpu_stop,
+#           gpu_load_imem, gpu_read_imem, gpu_read_dmem, gpu_write_dmem,
+#           dma_fifo_to_gpu, dma_gpu_to_fifo, gpu_test
+#
+# Based on reference_nic (like Lab7). The NF2 register generator assigns
+# addresses based on project.xml memalloc order + each module's blocksize.
+#
+# Address formula:
+#   PCI_byte_addr = BAR2 + reg_addr * 4
+#   reg_addr = {BLOCK_ADDR[16:0], word_offset[5:0]}   (23 bits total)
+#
+# BLOCK_ADDR is assigned by the generator. After first `make` on the VM,
+# grep the generated include/registers.v for LAB8_BLOCK_ADDR and update
+# $BASE below if it differs.
+#
+# Register map (word offsets from block base):
+#   0x00 CTRL           [SW] bit[0]=soft_reset
+#   0x01 STATUS         [HW] {pkt_word_cnt, head, tail, empty, full, pkt_ready}
+#   0x02 FIFO_MODE      [SW] 0=FIFO, 1=CPU, 2=GPU
+#   0x03 FIFO_DRAIN     [SW] bit[0]=drain_start (auto-clear)
+#   0x04 BRAM_ADDR      [SW] BRAM address [7:0]
+#   0x05 BRAM_WD_LO     [SW] write data [31:0]
+#   0x06 BRAM_WD_HI     [SW] write data [63:32]
+#   0x07 BRAM_WCTRL     [SW] write ctrl [7:0]
+#   0x08 BRAM_CMD       [SW] bit[0]=write strobe (auto-clear)
+#   0x09 BRAM_RD_LO     [HW] read data [31:0]
+#   0x0A BRAM_RD_HI     [HW] read data [63:32]
+#   0x0B BRAM_RCTRL     [HW] read ctrl [7:0]
+#   0x0C CPU_CTRL       [SW] bit[0]=start_stop, bit[1]=cpu_reset
+#   0x0D CPU_STATUS     [HW] {all_halted, cpsr, thread_id, running, ~reset}
+#   0x0E CPU_IMEM_ADDR  [SW] IMEM address [8:0]
+#   0x0F CPU_IMEM_WDATA [SW] IMEM write data [31:0]
+#   0x10 CPU_IMEM_CMD   [SW] bit[0]=write strobe (auto-clear)
+#   0x11 CPU_IMEM_RDATA [HW] IMEM readback [31:0]
+#   0x12 CPU_DMEM_ADDR  [SW] DMEM address [7:0]
+#   0x13 CPU_DMEM_WD_LO [SW] DMEM write data [31:0]
+#   0x14 CPU_DMEM_WD_HI [SW] DMEM write data [63:32]
+#   0x15 CPU_DMEM_CMD   [SW] bit[0]=write strobe (auto-clear)
+#   0x16 CPU_DMEM_RD_LO [HW] DMEM readback [31:0]
+#   0x17 CPU_DMEM_RD_HI [HW] DMEM readback [63:32]
+#   0x18 CPU_LA_ADDR    [SW] Logic analyzer addr [10:0]
+#   0x19 CPU_LA_RD_LO   [HW] LA readback [31:0]
+#   0x1A CPU_LA_RD_HI   [HW] LA readback [63:32]
+#   0x1B-0x1F (reserved padding)
+#   0x20 GPU_CTRL       [SW] bit[0]=gpu_reset (1=hold)
+#   0x21 GPU_STATUS     [HW] bit[0]=kernel_done, bit[1]=dma_busy
+#   0x22 GPU_IMEM_ADDR  [SW] IMEM address [9:0]
+#   0x23 GPU_IMEM_WDATA [SW] IMEM write data [31:0]
+#   0x24 GPU_IMEM_CMD   [SW] bit[0]=write strobe (auto-clear)
+#   0x25 GPU_IMEM_RDATA [HW] IMEM readback [31:0]
+#   0x26 GPU_DMEM_ADDR  [SW] DMEM address [9:0]
+#   0x27 GPU_DMEM_WD_LO [SW] DMEM write data [31:0]
+#   0x28 GPU_DMEM_WD_HI [SW] DMEM write data [63:32]
+#   0x29 GPU_DMEM_CMD   [SW] bit[0]=write strobe (auto-clear)
+#   0x2A GPU_DMEM_RD_LO [HW] DMEM readback [31:0]
+#   0x2B GPU_DMEM_RD_HI [HW] DMEM readback [63:32]
+#   0x2C DMA_CTRL       [SW] bit[0]=start (auto-clear), bit[1]=direction
+#   0x2D DMA_FIFO_ADDR  [SW] FIFO BRAM start address [7:0]
+#   0x2E DMA_GPU_ADDR   [SW] GPU DMEM start address [9:0]
+#   0x2F DMA_LENGTH     [SW] word count [7:0]
+# ============================================================================
+
+# --- Block base address ---
+# Placeholder: assumes LAB8_BLOCK_ADDR = 17'h00011 (after in_arb at 17'h00010).
+# reg_addr base = 17'h00011 << 6 = 23'h000440. PCI = BAR2 + 0x440*4 = 0x2001100.
+# UPDATE THIS after checking the generated registers.v on the VM.
+my $BASE = 0x2001100;
+
+# --- FIFO register addresses (PCI byte addr = BASE + word_offset * 4) ---
+my $CTRL_REG        = $BASE + 0x00 * 4;
+my $STATUS_REG      = $BASE + 0x01 * 4;
+my $FIFO_MODE_REG   = $BASE + 0x02 * 4;
+my $FIFO_DRAIN_REG  = $BASE + 0x03 * 4;
+my $BRAM_ADDR_REG   = $BASE + 0x04 * 4;
+my $BRAM_WD_LO_REG  = $BASE + 0x05 * 4;
+my $BRAM_WD_HI_REG  = $BASE + 0x06 * 4;
+my $BRAM_WCTRL_REG  = $BASE + 0x07 * 4;
+my $BRAM_CMD_REG    = $BASE + 0x08 * 4;
+my $BRAM_RD_LO_REG  = $BASE + 0x09 * 4;
+my $BRAM_RD_HI_REG  = $BASE + 0x0A * 4;
+my $BRAM_RCTRL_REG  = $BASE + 0x0B * 4;
+
+# --- CPU register addresses ---
+my $CPU_CTRL_REG       = $BASE + 0x0C * 4;
+my $CPU_STATUS_REG     = $BASE + 0x0D * 4;
+my $CPU_IMEM_ADDR_REG  = $BASE + 0x0E * 4;
+my $CPU_IMEM_WDATA_REG = $BASE + 0x0F * 4;
+my $CPU_IMEM_CMD_REG   = $BASE + 0x10 * 4;
+my $CPU_IMEM_RDATA_REG = $BASE + 0x11 * 4;
+my $CPU_DMEM_ADDR_REG  = $BASE + 0x12 * 4;
+my $CPU_DMEM_WD_LO_REG = $BASE + 0x13 * 4;
+my $CPU_DMEM_WD_HI_REG = $BASE + 0x14 * 4;
+my $CPU_DMEM_CMD_REG   = $BASE + 0x15 * 4;
+my $CPU_DMEM_RD_LO_REG = $BASE + 0x16 * 4;
+my $CPU_DMEM_RD_HI_REG = $BASE + 0x17 * 4;
+my $CPU_LA_ADDR_REG    = $BASE + 0x18 * 4;
+my $CPU_LA_RD_LO_REG   = $BASE + 0x19 * 4;
+my $CPU_LA_RD_HI_REG   = $BASE + 0x1A * 4;
+
+# --- GPU register addresses ---
+my $GPU_CTRL_REG        = $BASE + 0x20 * 4;
+my $GPU_STATUS_REG      = $BASE + 0x21 * 4;
+my $GPU_IMEM_ADDR_REG   = $BASE + 0x22 * 4;
+my $GPU_IMEM_WDATA_REG  = $BASE + 0x23 * 4;
+my $GPU_IMEM_CMD_REG    = $BASE + 0x24 * 4;
+my $GPU_IMEM_RDATA_REG  = $BASE + 0x25 * 4;
+my $GPU_DMEM_ADDR_REG   = $BASE + 0x26 * 4;
+my $GPU_DMEM_WD_LO_REG  = $BASE + 0x27 * 4;
+my $GPU_DMEM_WD_HI_REG  = $BASE + 0x28 * 4;
+my $GPU_DMEM_CMD_REG    = $BASE + 0x29 * 4;
+my $GPU_DMEM_RD_LO_REG  = $BASE + 0x2A * 4;
+my $GPU_DMEM_RD_HI_REG  = $BASE + 0x2B * 4;
+
+# --- DMA register addresses ---
+my $DMA_CTRL_REG        = $BASE + 0x2C * 4;
+my $DMA_FIFO_ADDR_REG   = $BASE + 0x2D * 4;
+my $DMA_GPU_ADDR_REG    = $BASE + 0x2E * 4;
+my $DMA_LENGTH_REG      = $BASE + 0x2F * 4;
+
+# --- Low-level register access (uses NetFPGA regread/regwrite CLI) ---
+sub regwrite {
+    my ($addr, $value) = @_;
+    my $cmd = sprintf("regwrite 0x%07x 0x%08x", $addr, $value);
+    `$cmd`;
+}
+
+sub regread {
+    my ($addr) = @_;
+    my $cmd = sprintf("regread 0x%07x", $addr);
+    my @out = `$cmd`;
+    my $result = $out[0] || "";
+    if ($result =~ /Reg\s+\S+\s+\(\d+\):\s+(0x[0-9a-fA-F]+)/) {
+        return hex($1);
+    }
+    return 0;
+}
+
+# ============================================================================
+# FIFO control helpers
+# ============================================================================
+
+sub fifo_reset {
+    regwrite($CTRL_REG, 0x1);   # bit[0] = soft_reset
+    regwrite($CTRL_REG, 0x0);   # release
+}
+
+sub fifo_set_mode {
+    my ($mode) = @_;
+    regwrite($FIFO_MODE_REG, $mode & 0x3);
+}
+
+sub fifo_drain {
+    regwrite($FIFO_DRAIN_REG, 0x1);   # auto-clears
+}
+
+# ============================================================================
+# BRAM access helpers (indirect: set addr, then read/write)
+# ============================================================================
+
+sub bram_read {
+    my ($bram_addr) = @_;
+    regwrite($BRAM_ADDR_REG, $bram_addr & 0xFF);
+    # Wait for BRAM latency (PCI bus turnaround provides this naturally,
+    # but add an explicit read of addr reg to be safe)
+    regread($BRAM_ADDR_REG);
+    my $lo   = regread($BRAM_RD_LO_REG);
+    my $hi   = regread($BRAM_RD_HI_REG);
+    my $ctrl = regread($BRAM_RCTRL_REG) & 0xFF;
+    return ($ctrl, $hi, $lo);
+}
+
+sub bram_write {
+    my ($bram_addr, $ctrl, $hi, $lo) = @_;
+    regwrite($BRAM_ADDR_REG,  $bram_addr & 0xFF);
+    regwrite($BRAM_WD_LO_REG, $lo);
+    regwrite($BRAM_WD_HI_REG, $hi);
+    regwrite($BRAM_WCTRL_REG, $ctrl & 0xFF);
+    regwrite($BRAM_CMD_REG,   0x1);   # write strobe (auto-clears)
+}
+
+# ============================================================================
+# CPU helpers
+# ============================================================================
+
+sub cpu_assert_reset {
+    # bit[1]=cpu_reset, bit[0]=start_stop=0 (stopped)
+    regwrite($CPU_CTRL_REG, 0x2);
+}
+
+sub cpu_release_reset {
+    # clear reset, keep stopped
+    regwrite($CPU_CTRL_REG, 0x0);
+}
+
+sub cpu_start {
+    # bit[0]=start_stop=1, bit[1]=cpu_reset=0
+    regwrite($CPU_CTRL_REG, 0x1);
+}
+
+sub cpu_stop {
+    regwrite($CPU_CTRL_REG, 0x0);
+}
+
+sub cpu_write_imem {
+    my ($addr, $data) = @_;
+    regwrite($CPU_IMEM_ADDR_REG,  $addr & 0x1FF);
+    regwrite($CPU_IMEM_WDATA_REG, $data);
+    regwrite($CPU_IMEM_CMD_REG,   0x1);   # write strobe (auto-clears)
+}
+
+sub cpu_read_imem {
+    my ($addr) = @_;
+    regwrite($CPU_IMEM_ADDR_REG, $addr & 0x1FF);
+    regread($CPU_IMEM_ADDR_REG);   # bus turnaround
+    return regread($CPU_IMEM_RDATA_REG);
+}
+
+sub cpu_write_dmem {
+    my ($addr, $hi, $lo) = @_;
+    regwrite($CPU_DMEM_ADDR_REG,  $addr & 0xFF);
+    regwrite($CPU_DMEM_WD_LO_REG, $lo);
+    regwrite($CPU_DMEM_WD_HI_REG, $hi);
+    regwrite($CPU_DMEM_CMD_REG,   0x1);   # write strobe (auto-clears)
+}
+
+sub cpu_read_dmem {
+    my ($addr) = @_;
+    regwrite($CPU_DMEM_ADDR_REG, $addr & 0xFF);
+    regread($CPU_DMEM_ADDR_REG);   # bus turnaround
+    my $lo = regread($CPU_DMEM_RD_LO_REG);
+    my $hi = regread($CPU_DMEM_RD_HI_REG);
+    return ($hi, $lo);
+}
+
+sub cpu_read_la {
+    my ($addr) = @_;
+    regwrite($CPU_LA_ADDR_REG, $addr & 0x7FF);
+    regread($CPU_LA_ADDR_REG);   # bus turnaround
+    my $lo = regread($CPU_LA_RD_LO_REG);
+    my $hi = regread($CPU_LA_RD_HI_REG);
+    return ($hi, $lo);
+}
+
+# ============================================================================
+# GPU helpers
+# ============================================================================
+
+sub gpu_assert_reset {
+    regwrite($GPU_CTRL_REG, 0x1);   # bit[0]=gpu_reset=1 (hold in reset)
+}
+
+sub gpu_release_reset {
+    regwrite($GPU_CTRL_REG, 0x0);   # release reset -> GPU starts executing
+}
+
+sub gpu_write_imem {
+    my ($addr, $data) = @_;
+    regwrite($GPU_IMEM_ADDR_REG,  $addr & 0x3FF);
+    regwrite($GPU_IMEM_WDATA_REG, $data);
+    regwrite($GPU_IMEM_CMD_REG,   0x1);   # write strobe (auto-clears)
+}
+
+sub gpu_read_imem {
+    my ($addr) = @_;
+    regwrite($GPU_IMEM_ADDR_REG, $addr & 0x3FF);
+    regread($GPU_IMEM_ADDR_REG);   # bus turnaround
+    return regread($GPU_IMEM_RDATA_REG);
+}
+
+sub gpu_write_dmem {
+    my ($addr, $hi, $lo) = @_;
+    regwrite($GPU_DMEM_ADDR_REG,   $addr & 0x3FF);
+    regwrite($GPU_DMEM_WD_LO_REG,  $lo);
+    regwrite($GPU_DMEM_WD_HI_REG,  $hi);
+    regwrite($GPU_DMEM_CMD_REG,    0x1);   # write strobe (auto-clears)
+}
+
+sub gpu_read_dmem {
+    my ($addr) = @_;
+    regwrite($GPU_DMEM_ADDR_REG, $addr & 0x3FF);
+    regread($GPU_DMEM_ADDR_REG);   # bus turnaround
+    my $lo = regread($GPU_DMEM_RD_LO_REG);
+    my $hi = regread($GPU_DMEM_RD_HI_REG);
+    return ($hi, $lo);
+}
+
+# ============================================================================
+# DMA helpers
+# ============================================================================
+
+sub dma_transfer_and_wait {
+    my ($fifo_addr, $gpu_addr, $length, $direction) = @_;
+    # direction: 0=FIFO->GPU, 1=GPU->FIFO
+    regwrite($DMA_FIFO_ADDR_REG, $fifo_addr & 0xFF);
+    regwrite($DMA_GPU_ADDR_REG,  $gpu_addr & 0x3FF);
+    regwrite($DMA_LENGTH_REG,    $length & 0xFF);
+    # Start: bit[0]=start, bit[1]=direction
+    regwrite($DMA_CTRL_REG, (($direction & 1) << 1) | 1);
+
+    # Poll GPU_STATUS[1]=dma_busy until clear (or timeout)
+    for (my $i = 0; $i < 100; $i++) {
+        my $s = regread($GPU_STATUS_REG);
+        if (($s & 0x2) == 0) {
+            return 1;   # done
+        }
+        select(undef, undef, undef, 0.01);  # 10ms delay
+    }
+    print "WARNING: DMA transfer did not complete within 1s\n";
+    return 0;
+}
+
+# ============================================================================
+# Commands — FIFO
+# ============================================================================
+
+sub cmd_reset {
+    fifo_reset();
+    print "FIFO soft reset asserted and released.\n";
+}
+
+sub cmd_status {
+    my $s = regread($STATUS_REG);
+    my $pkt_ready    = $s & 1;
+    my $fifo_full    = ($s >> 1) & 1;
+    my $fifo_empty   = ($s >> 2) & 1;
+    my $tail         = ($s >> 8) & 0xFF;
+    my $head         = ($s >> 16) & 0xFF;
+    my $pkt_word_cnt = ($s >> 24) & 0xFF;
+
+    my $mode = regread($FIFO_MODE_REG) & 0x3;
+    my @mode_names = ("FIFO", "CPU", "GPU", "RESERVED");
+
+    printf("STATUS = 0x%08x\n", $s);
+    printf("  pkt_ready=%d  fifo_full=%d  fifo_empty=%d\n",
+           $pkt_ready, $fifo_full, $fifo_empty);
+    printf("  pkt_word_cnt=%d  head=%d  tail=%d\n",
+           $pkt_word_cnt, $head, $tail);
+    printf("  mode=%d (%s)\n", $mode, $mode_names[$mode]);
+}
+
+sub cmd_fifo_read {
+    my ($start, $count) = @_;
+    $start = 0 unless defined $start;
+    $count = 8 unless defined $count;
+
+    # Switch to CPU mode for BRAM access
+    fifo_set_mode(1);
+
+    for (my $i = $start; $i < $start + $count; $i++) {
+        my ($ctrl, $hi, $lo) = bram_read($i);
+        printf("BRAM[%3d]: ctrl=0x%02x  data=0x%08x_%08x\n",
+               $i, $ctrl, $hi, $lo);
+    }
+
+    # Switch back to FIFO mode
+    fifo_set_mode(0);
+}
+
+sub cmd_fifo_write {
+    my ($addr, $hi_hex, $lo_hex) = @_;
+    die "Usage: lab8reg fifo_write <addr> <data_hi_hex> <data_lo_hex>\n"
+        unless defined $addr && defined $hi_hex && defined $lo_hex;
+
+    my $hi = hex($hi_hex);
+    my $lo = hex($lo_hex);
+
+    # Switch to CPU mode
+    fifo_set_mode(1);
+
+    bram_write($addr + 0, 0x00, $hi, $lo);
+    printf("BRAM[%3d] <= ctrl=0x00  data=0x%08x_%08x\n", $addr + 0, $hi, $lo);
+
+    # Read back to verify
+    my ($rctrl, $rhi, $rlo) = bram_read($addr + 0);
+    printf("Readback:   ctrl=0x%02x  data=0x%08x_%08x\n", $rctrl, $rhi, $rlo);
+
+    # Switch back to FIFO mode
+    fifo_set_mode(0);
+}
+
+sub cmd_fifo_drain {
+    fifo_drain();
+    print "Drain triggered (auto-clear strobe).\n";
+}
+
+sub cmd_mode {
+    my ($mode) = @_;
+    die "Usage: lab8reg mode <0|1|2>\n" unless defined $mode;
+    my @mode_names = ("FIFO", "CPU", "GPU", "RESERVED");
+    fifo_set_mode($mode + 0);
+    printf("Mode set to %d (%s)\n", $mode + 0, $mode_names[$mode + 0]);
+}
+
+# ============================================================================
+# Commands — CPU
+# ============================================================================
+
+sub cmd_cpu_status {
+    my $s = regread($CPU_STATUS_REG);
+    my $not_reset  = $s & 1;
+    my $running    = ($s >> 1) & 1;
+    my $thread_id  = ($s >> 10) & 0x3;
+    my $cpsr_0     = ($s >> 12) & 0xF;
+    my $cpsr_1     = ($s >> 16) & 0xF;
+    my $cpsr_2     = ($s >> 20) & 0xF;
+    my $cpsr_3     = ($s >> 24) & 0xF;
+    my $all_halted = ($s >> 31) & 1;
+
+    my $ctrl = regread($CPU_CTRL_REG);
+
+    printf("CPU_STATUS = 0x%08x  CPU_CTRL = 0x%08x\n", $s, $ctrl);
+    printf("  all_halted=%d  running=%d  reset=%d  thread_id=%d\n",
+           $all_halted, $running, !$not_reset, $thread_id);
+    printf("  cpsr: T0=0x%x  T1=0x%x  T2=0x%x  T3=0x%x\n",
+           $cpsr_0, $cpsr_1, $cpsr_2, $cpsr_3);
+}
+
+sub cmd_cpu_reset {
+    # Assert reset and keep it asserted. Do NOT release — the pipeline
+    # runs wild with start_stop=0. Use cpu_start to release + run atomically.
+    cpu_assert_reset();
+    print "CPU reset (held in reset).\n";
+}
+
+sub cmd_cpu_start {
+    # Set mode to CPU (1) FIRST so cpu_drives_proc is true when CPU wakes.
+    # Then atomically release reset + set start_stop=1 (CPU_CTRL=0x1).
+    # This avoids the rst=0,start_stop=0 state where the pipeline runs
+    # but the thread counter is frozen.
+    fifo_set_mode(1);
+    cpu_start();    # writes CPU_CTRL=0x1: releases reset + starts
+    print "CPU started (mode=CPU).\n";
+}
+
+sub cmd_cpu_stop {
+    # Re-assert reset to stop cleanly. Writing CPU_CTRL=0x0 would leave
+    # rst=0,start_stop=0 which lets the pipeline run with frozen thread counter.
+    cpu_assert_reset();
+    print "CPU stopped (held in reset).\n";
+}
+
+sub cmd_cpu_load_imem {
+    my ($filename) = @_;
+    die "Usage: lab8reg cpu_load_imem <hex_file>\n" unless defined $filename;
+
+    open(my $fh, '<', $filename) or die "Cannot open $filename: $!\n";
+
+    # Stop CPU and assert reset while loading
+    cpu_assert_reset();
+
+    my $addr = 0;
+    while (my $line = <$fh>) {
+        chomp $line;
+        $line =~ s/^\s+//;
+        $line =~ s/\s+$//;
+        next if $line eq '' || $line =~ /^\/\//;   # skip blank/comment lines
+
+        my $data = hex($line);
+        cpu_write_imem($addr, $data);
+        $addr++;
+    }
+    close($fh);
+
+    # Keep CPU in reset! If we release reset with start_stop=0, the pipeline
+    # runs with a frozen thread counter (only T0 executes), corrupting state.
+    # cpu_start will atomically release reset + set start_stop=1.
+    printf("Loaded %d instructions from %s into IMEM (CPU held in reset).\n", $addr, $filename);
+}
+
+sub cmd_cpu_read_imem {
+    my ($start, $count) = @_;
+    $start = 0 unless defined $start;
+    $count = 16 unless defined $count;
+
+    for (my $i = $start; $i < $start + $count; $i++) {
+        my $data = cpu_read_imem($i);
+        printf("IMEM[%3d]: 0x%08x\n", $i, $data);
+    }
+}
+
+sub cmd_cpu_read_dmem {
+    my ($start, $count) = @_;
+    $start = 0 unless defined $start;
+    $count = 8 unless defined $count;
+
+    for (my $i = $start; $i < $start + $count; $i++) {
+        my ($hi, $lo) = cpu_read_dmem($i);
+        printf("DMEM[%3d]: 0x%08x_%08x\n", $i, $hi, $lo);
+    }
+}
+
+sub cmd_cpu_write_dmem {
+    my ($addr, $hi_hex, $lo_hex) = @_;
+    die "Usage: lab8reg cpu_write_dmem <addr> <data_hi_hex> <data_lo_hex>\n"
+        unless defined $addr && defined $hi_hex && defined $lo_hex;
+
+    my $hi = hex($hi_hex);
+    my $lo = hex($lo_hex);
+
+    cpu_write_dmem($addr + 0, $hi, $lo);
+    printf("DMEM[%3d] <= 0x%08x_%08x\n", $addr + 0, $hi, $lo);
+
+    # Read back
+    my ($rhi, $rlo) = cpu_read_dmem($addr + 0);
+    printf("Readback:    0x%08x_%08x\n", $rhi, $rlo);
+}
+
+sub cmd_cpu_test {
+    my ($filename) = @_;
+    die "Usage: lab8reg cpu_test <hex_file>\n" .
+        "  Full CPU-FIFO test: load IMEM, write BRAM[1]=0x1000, start CPU,\n" .
+        "  wait for halt, verify BRAM[1]=0x102A\n" unless defined $filename;
+
+    print "=== CPU-FIFO Integration Test ===\n\n";
+
+    # Step 1: Reset everything
+    print "1. Reset FIFO + CPU...\n";
+    fifo_reset();
+    cpu_assert_reset();
+
+    # Step 2: Load IMEM (slow — ~30 sec, but BRAM doesn't matter yet)
+    print "2. Loading IMEM from $filename...\n";
+    cmd_cpu_load_imem($filename);
+
+    # Step 3: Write BRAM[1] = 0x1000 (do this AFTER IMEM load to minimize
+    # exposure to network packet corruption on Port A — Bug: in_rdy not
+    # gated by mode in current bitfile)
+    print "3. Writing BRAM[1] = 0x00000000_00001000...\n";
+    fifo_set_mode(1);  # CPU mode — stay here, don't switch back!
+    bram_write(1, 0x00, 0x00000000, 0x00001000);
+
+    # Verify BRAM[1] before starting CPU
+    my ($rctrl, $rhi, $rlo) = bram_read(1);
+    printf("   BRAM[1] verify: ctrl=0x%02x data=0x%08x_%08x\n", $rctrl, $rhi, $rlo);
+    if ($rlo != 0x00001000 || $rhi != 0x00000000) {
+        print "   WARNING: BRAM[1] doesn't match! Network packet may have corrupted it.\n";
+        print "   Re-writing BRAM[1]...\n";
+        bram_write(1, 0x00, 0x00000000, 0x00001000);
+        ($rctrl, $rhi, $rlo) = bram_read(1);
+        printf("   BRAM[1] re-verify: ctrl=0x%02x data=0x%08x_%08x\n", $rctrl, $rhi, $rlo);
+    }
+
+    # Step 4: Start CPU (mode already 1, just release reset + start)
+    print "4. Starting CPU (mode already CPU)...\n";
+    cpu_start();  # CPU_CTRL=0x1: release reset + start_stop=1
+    print "   CPU started.\n";
+
+    # Step 5: Wait for all_halted
+    print "5. Waiting for all_halted...\n";
+    my $halted = 0;
+    for (my $i = 0; $i < 100; $i++) {
+        my $s = regread($CPU_STATUS_REG);
+        if ($s & 0x80000000) {
+            printf("   all_halted=1 (CPU_STATUS=0x%08x)\n", $s);
+            $halted = 1;
+            last;
+        }
+        select(undef, undef, undef, 0.01);  # 10ms delay
+    }
+    if (!$halted) {
+        my $s = regread($CPU_STATUS_REG);
+        printf("   WARNING: all_halted not set after 1s (CPU_STATUS=0x%08x)\n", $s);
+        print "   Continuing anyway (CPU may still be in B. loop)...\n";
+    }
+
+    # Step 6: Stop CPU
+    cpu_assert_reset();
+
+    # Step 7: Verify BRAM[1]
+    print "6. Reading BRAM[1]...\n";
+    ($rctrl, $rhi, $rlo) = bram_read(1);
+    printf("   BRAM[1]: ctrl=0x%02x data=0x%08x_%08x\n", $rctrl, $rhi, $rlo);
+
+    my $expected_lo = 0x0000102A;  # 0x1000 + 42
+    my $expected_hi = 0x00000000;
+    if ($rlo == $expected_lo && $rhi == $expected_hi) {
+        printf("   PASS: BRAM[1] = 0x%08x_%08x (0x1000 + 42 = 0x102A)\n",
+               $rhi, $rlo);
+    } else {
+        printf("   FAIL: expected 0x%08x_%08x, got 0x%08x_%08x\n",
+               $expected_hi, $expected_lo, $rhi, $rlo);
+        if ($rlo == 0x00001000) {
+            print "   (Value unchanged — CPU may not have accessed FIFO BRAM)\n";
+        }
+    }
+
+    # Step 8: Show LA trace (first 10 entries)
+    print "\n7. LA Trace (first 10 entries):\n";
+    for (my $i = 0; $i < 10; $i++) {
+        my ($hi, $lo) = cpu_read_la($i);
+        printf("   LA[%2d]: 0x%08x_%08x\n", $i, $hi, $lo);
+    }
+
+    # Switch back to FIFO mode
+    fifo_set_mode(0);
+    print "\nDone. Mode set back to FIFO.\n";
+}
+
+sub cmd_cpu_la_read {
+    my ($start, $count) = @_;
+    $start = 0 unless defined $start;
+    $count = 16 unless defined $count;
+
+    for (my $i = $start; $i < $start + $count; $i++) {
+        my ($hi, $lo) = cpu_read_la($i);
+        printf("LA[%4d]: 0x%08x_%08x\n", $i, $hi, $lo);
+    }
+}
+
+# ============================================================================
+# Commands — GPU
+# ============================================================================
+
+sub cmd_gpu_status {
+    my $s = regread($GPU_STATUS_REG);
+    my $kernel_done = $s & 1;
+    my $dma_busy    = ($s >> 1) & 1;
+    my $ctrl = regread($GPU_CTRL_REG);
+    my $gpu_reset = $ctrl & 1;
+
+    printf("GPU_STATUS = 0x%08x  GPU_CTRL = 0x%08x\n", $s, $ctrl);
+    printf("  kernel_done=%d  dma_busy=%d  gpu_reset=%d\n",
+           $kernel_done, $dma_busy, $gpu_reset);
+}
+
+sub cmd_gpu_reset {
+    gpu_assert_reset();
+    print "GPU held in reset.\n";
+}
+
+sub cmd_gpu_start {
+    gpu_release_reset();
+    print "GPU released from reset (executing).\n";
+}
+
+sub cmd_gpu_stop {
+    gpu_assert_reset();
+    print "GPU stopped (held in reset).\n";
+}
+
+sub cmd_gpu_load_imem {
+    my ($filename) = @_;
+    die "Usage: lab8reg gpu_load_imem <hex_file>\n" unless defined $filename;
+
+    open(my $fh, '<', $filename) or die "Cannot open $filename: $!\n";
+
+    # Hold GPU in reset while loading
+    gpu_assert_reset();
+
+    my $addr = 0;
+    while (my $line = <$fh>) {
+        chomp $line;
+        $line =~ s/^\s+//;
+        $line =~ s/\s+$//;
+        next if $line eq '' || $line =~ /^\/\//;
+
+        my $data = hex($line);
+        gpu_write_imem($addr, $data);
+        $addr++;
+    }
+    close($fh);
+
+    printf("Loaded %d instructions from %s into GPU IMEM (GPU held in reset).\n",
+           $addr, $filename);
+}
+
+sub cmd_gpu_read_imem {
+    my ($start, $count) = @_;
+    $start = 0 unless defined $start;
+    $count = 16 unless defined $count;
+
+    for (my $i = $start; $i < $start + $count; $i++) {
+        my $data = gpu_read_imem($i);
+        printf("GPU IMEM[%3d]: 0x%08x\n", $i, $data);
+    }
+}
+
+sub cmd_gpu_read_dmem {
+    my ($start, $count) = @_;
+    $start = 0 unless defined $start;
+    $count = 8 unless defined $count;
+
+    for (my $i = $start; $i < $start + $count; $i++) {
+        my ($hi, $lo) = gpu_read_dmem($i);
+        printf("GPU DMEM[%3d]: 0x%08x_%08x\n", $i, $hi, $lo);
+    }
+}
+
+sub cmd_gpu_write_dmem {
+    my ($addr, $hi_hex, $lo_hex) = @_;
+    die "Usage: lab8reg gpu_write_dmem <addr> <data_hi_hex> <data_lo_hex>\n"
+        unless defined $addr && defined $hi_hex && defined $lo_hex;
+
+    my $hi = hex($hi_hex);
+    my $lo = hex($lo_hex);
+
+    gpu_write_dmem($addr + 0, $hi, $lo);
+    printf("GPU DMEM[%3d] <= 0x%08x_%08x\n", $addr + 0, $hi, $lo);
+
+    # Read back
+    my ($rhi, $rlo) = gpu_read_dmem($addr + 0);
+    printf("Readback:       0x%08x_%08x\n", $rhi, $rlo);
+}
+
+# ============================================================================
+# Commands — DMA
+# ============================================================================
+
+sub cmd_dma_fifo_to_gpu {
+    my ($fifo_addr, $gpu_addr, $length) = @_;
+    die "Usage: lab8reg dma_fifo_to_gpu <fifo_addr> <gpu_addr> <length>\n"
+        unless defined $fifo_addr && defined $gpu_addr && defined $length;
+
+    printf("DMA FIFO->GPU: FIFO[%d..%d] -> GPU DMEM[%d..%d] (%d words)\n",
+           $fifo_addr+0, $fifo_addr+$length-1,
+           $gpu_addr+0, $gpu_addr+$length-1, $length+0);
+
+    if (dma_transfer_and_wait($fifo_addr+0, $gpu_addr+0, $length+0, 0)) {
+        print "DMA complete.\n";
+    }
+}
+
+sub cmd_dma_gpu_to_fifo {
+    my ($gpu_addr, $fifo_addr, $length) = @_;
+    die "Usage: lab8reg dma_gpu_to_fifo <gpu_addr> <fifo_addr> <length>\n"
+        unless defined $gpu_addr && defined $fifo_addr && defined $length;
+
+    printf("DMA GPU->FIFO: GPU DMEM[%d..%d] -> FIFO[%d..%d] (%d words)\n",
+           $gpu_addr+0, $gpu_addr+$length-1,
+           $fifo_addr+0, $fifo_addr+$length-1, $length+0);
+
+    if (dma_transfer_and_wait($fifo_addr+0, $gpu_addr+0, $length+0, 1)) {
+        print "DMA complete.\n";
+    }
+}
+
+# ============================================================================
+# Commands — BRAM write with full ctrl, packet echo
+# ============================================================================
+
+sub cmd_bram_write_full {
+    my ($addr, $ctrl_hex, $hi_hex, $lo_hex) = @_;
+    die "Usage: lab8reg bram_write_full <addr> <ctrl_hex> <hi_hex> <lo_hex>\n"
+        unless defined $addr && defined $ctrl_hex && defined $hi_hex && defined $lo_hex;
+
+    my $ctrl = hex($ctrl_hex);
+    my $hi = hex($hi_hex);
+    my $lo = hex($lo_hex);
+
+    fifo_set_mode(1);
+    bram_write($addr + 0, $ctrl & 0xFF, $hi, $lo);
+    printf("BRAM[%3d] <= ctrl=0x%02x  data=0x%08x_%08x\n", $addr + 0, $ctrl, $hi, $lo);
+
+    my ($rctrl, $rhi, $rlo) = bram_read($addr + 0);
+    printf("Readback:   ctrl=0x%02x  data=0x%08x_%08x\n", $rctrl, $rhi, $rlo);
+    fifo_set_mode(0);
+}
+
+sub cmd_packet_echo {
+    my ($dst_port_hex) = @_;
+
+    print "=== Packet Echo Test ===\n\n";
+
+    # Step 1: Check for packet
+    print "1. Checking for packet...\n";
+    my $s = regread($STATUS_REG);
+    my $pkt_ready = $s & 1;
+    my $pkt_word_cnt = ($s >> 24) & 0xFF;
+    if (!$pkt_ready) {
+        print "   No packet in FIFO. Send a packet from a sub-node first.\n";
+        print "   Example: on node0, run: ping -c 1 <fpga_nf2c0_ip>\n";
+        return;
+    }
+    printf("   Packet ready: %d words\n", $pkt_word_cnt);
+
+    # Step 2: Read header
+    # NF2.1 header: {dst_port[15:0], word_length[15:0], src_port[15:0], byte_length[15:0]}
+    print "2. Reading NF2.1 module header (BRAM[0])...\n";
+    fifo_set_mode(1);
+    my ($hctrl, $hhi, $hlo) = bram_read(0);
+    my $orig_dst = ($hhi >> 16) & 0xFFFF;
+    my $word_len = $hhi & 0xFFFF;
+    my $src_port = ($hlo >> 16) & 0xFFFF;
+    my $byte_len = $hlo & 0xFFFF;
+    printf("   ctrl=0x%02x  dst_port=0x%04x  word_len=%d  src_port=0x%04x  byte_len=%d\n",
+           $hctrl, $orig_dst, $word_len, $src_port, $byte_len);
+
+    # Decode ports (NF2.1 one-hot: MAC0=0x01, CPU0=0x02, MAC1=0x04, ...)
+    my %port_names = (0x01=>"MAC0/nf2c0", 0x02=>"CPU0", 0x04=>"MAC1/nf2c1",
+                      0x08=>"CPU1", 0x10=>"MAC2/nf2c2", 0x20=>"CPU2",
+                      0x40=>"MAC3/nf2c3", 0x80=>"CPU3");
+    printf("   src = %s,  dst = %s\n",
+           $port_names{$src_port} || sprintf("0x%04x", $src_port),
+           $port_names{$orig_dst} || sprintf("0x%04x", $orig_dst));
+
+    # Step 3: Show data words
+    print "3. Packet data words:\n";
+    my $show = ($pkt_word_cnt > 8) ? 8 : $pkt_word_cnt;
+    for (my $i = 1; $i < $show; $i++) {
+        my ($rc, $rh, $rl) = bram_read($i);
+        printf("   BRAM[%d]: ctrl=0x%02x  data=0x%08x_%08x\n", $i, $rc, $rh, $rl);
+    }
+    if ($pkt_word_cnt > 8) {
+        printf("   ... (%d more words)\n", $pkt_word_cnt - 8);
+    }
+
+    # Step 4: Determine dst_port
+    my $new_dst;
+    if (defined $dst_port_hex) {
+        $new_dst = hex($dst_port_hex);
+        printf("4. Using specified dst_port=0x%04x (%s)\n", $new_dst,
+               $port_names{$new_dst} || "unknown");
+    } else {
+        if ($src_port == 0) {
+            print "4. src_port=0x0000 (not set by output_port_lookup). Must specify dst_port.\n";
+            print "   Usage: lab8reg packet_echo <dst_port_hex>\n";
+            print "   Ports: 01=MAC0(node0) 04=MAC1(node1) 10=MAC2(node2) 40=MAC3(node3)\n";
+            fifo_set_mode(0);
+            return;
+        }
+        # Default: echo back to source MAC port
+        $new_dst = $src_port;
+        printf("4. No dst_port specified — echoing back to src_port=0x%04x (%s)\n",
+               $new_dst, $port_names{$new_dst} || "unknown");
+    }
+
+    # Step 5: Rewrite header (PCI write with ctrl=0xFF)
+    # dst_port is data[63:48] = upper 16 bits of $hhi
+    my $new_hi = (($new_dst & 0xFFFF) << 16) | ($word_len & 0xFFFF);
+    printf("5. Rewriting header: dst_port 0x%04x -> 0x%04x (ctrl=0xFF preserved)...\n",
+           $orig_dst, $new_dst);
+    bram_write(0, 0xFF, $new_hi, $hlo);
+    my ($vc, $vh, $vl) = bram_read(0);
+    printf("   Verify: ctrl=0x%02x  data=0x%08x_%08x\n", $vc, $vh, $vl);
+
+    # Step 6: Drain
+    print "6. Switching to FIFO mode and draining...\n";
+    fifo_set_mode(0);
+    fifo_drain();
+    print "   Drain triggered.\n";
+
+    printf("\n=== Packet Echo Complete ===\n");
+    printf("Packet sent to %s.\n",
+           $port_names{$new_dst} || sprintf("port 0x%04x", $new_dst));
+
+}
+
+# ============================================================================
+# Commands — Integration test (GPU + DMA)
+# ============================================================================
+
+sub cmd_gpu_test {
+    my ($filename) = @_;
+    die "Usage: lab8reg gpu_test <hex_file>\n" .
+        "  Full GPU-DMA test: inject packet, DMA to GPU, run kernel, DMA back,\n" .
+        "  verify results. Use HALT-only hex for passthrough test.\n"
+        unless defined $filename;
+
+    print "=== GPU-DMA Integration Test ===\n\n";
+
+    # Step 1: Reset GPU only (keep FIFO packet intact)
+    print "1. Reset GPU...\n";
+    gpu_assert_reset();
+
+    # Step 2: Check for packet in FIFO
+    print "2. Checking for packet...\n";
+    my $s = regread($STATUS_REG);
+    my $pkt_ready = $s & 1;
+    my $pkt_word_cnt = ($s >> 24) & 0xFF;
+    if (!$pkt_ready) {
+        print "   No packet in FIFO. Send a packet first, then retry.\n";
+        return;
+    }
+    printf("   Packet ready: %d words\n", $pkt_word_cnt);
+
+    # Step 3: Switch to GPU mode
+    print "3. Setting mode=GPU...\n";
+    fifo_set_mode(2);
+
+    # Step 4: Load GPU IMEM
+    print "4. Loading GPU IMEM from $filename...\n";
+    open(my $fh, '<', $filename) or die "Cannot open $filename: $!\n";
+    my $addr = 0;
+    while (my $line = <$fh>) {
+        chomp $line;
+        $line =~ s/^\s+//;
+        $line =~ s/\s+$//;
+        next if $line eq '' || $line =~ /^\/\//;
+        gpu_write_imem($addr, hex($line));
+        $addr++;
+    }
+    close($fh);
+    printf("   Loaded %d instructions.\n", $addr);
+
+    # Step 5: DMA FIFO->GPU (skip header word 0, copy data words 1..N)
+    my $data_words = $pkt_word_cnt - 1;   # exclude header
+    printf("5. DMA FIFO->GPU: FIFO[1..%d] -> GPU DMEM[0..%d] (%d words)...\n",
+           $pkt_word_cnt - 1, $data_words - 1, $data_words);
+    if (!dma_transfer_and_wait(1, 0, $data_words, 0)) {
+        print "   DMA failed!\n";
+        return;
+    }
+    print "   DMA complete.\n";
+
+    # Step 6: Verify GPU DMEM[0] (should match FIFO data word 1)
+    print "6. Verifying GPU DMEM[0]...\n";
+    my ($hi, $lo) = gpu_read_dmem(0);
+    printf("   GPU DMEM[0] = 0x%08x_%08x\n", $hi, $lo);
+
+    # Also show FIFO BRAM[1] for comparison
+    my ($rctrl, $rhi, $rlo) = bram_read(1);
+    printf("   FIFO BRAM[1] = 0x%08x_%08x (ctrl=0x%02x)\n", $rhi, $rlo, $rctrl);
+
+    # Step 7: Run GPU kernel
+    print "7. Running GPU kernel...\n";
+    gpu_release_reset();
+
+    # Poll kernel_done
+    my $done = 0;
+    for (my $i = 0; $i < 200; $i++) {
+        $s = regread($GPU_STATUS_REG);
+        if ($s & 1) {
+            printf("   kernel_done after polling %d times\n", $i);
+            $done = 1;
+            last;
+        }
+        select(undef, undef, undef, 0.01);  # 10ms
+    }
+    if (!$done) {
+        printf("   WARNING: kernel_done not set after 2s (GPU_STATUS=0x%08x)\n",
+               regread($GPU_STATUS_REG));
+    }
+
+    # Re-assert GPU reset before DMA back
+    gpu_assert_reset();
+
+    # Step 8: Show GPU DMEM after kernel
+    print "8. GPU DMEM after kernel:\n";
+    for (my $i = 0; $i < $data_words && $i < 8; $i++) {
+        ($hi, $lo) = gpu_read_dmem($i);
+        printf("   DMEM[%d] = 0x%08x_%08x\n", $i, $hi, $lo);
+    }
+
+    # Step 9: DMA GPU->FIFO
+    printf("9. DMA GPU->FIFO: GPU DMEM[0..%d] -> FIFO[1..%d]...\n",
+           $data_words - 1, $pkt_word_cnt - 1);
+    if (!dma_transfer_and_wait(1, 0, $data_words, 1)) {
+        print "   DMA failed!\n";
+        return;
+    }
+    print "   DMA complete.\n";
+
+    # Step 10: Verify FIFO BRAM
+    print "10. FIFO BRAM after round-trip:\n";
+    for (my $i = 0; $i < $pkt_word_cnt && $i < 9; $i++) {
+        ($rctrl, $rhi, $rlo) = bram_read($i);
+        printf("    BRAM[%d]: ctrl=0x%02x data=0x%08x_%08x\n", $i, $rctrl, $rhi, $rlo);
+    }
+
+    # Step 11: Drain
+    print "11. Switching to FIFO mode and draining...\n";
+    fifo_set_mode(0);
+    fifo_drain();
+    print "    Drain triggered.\n";
+
+    print "\n=== GPU-DMA Test Complete ===\n";
+}
+
+# ============================================================================
+# Main — command dispatcher
+# ============================================================================
+sub usage {
+    print <<'EOF';
+Usage: lab8reg <command> [args...]
+
+  FIFO Control:
+    reset                           Soft reset FIFO
+    status                          Show FIFO status (pkt_ready, full, empty, etc.)
+    mode <0|1|2>                    Set FIFO mode (0=FIFO, 1=CPU, 2=GPU)
+    drain                           Trigger packet drain
+
+  BRAM access (auto-switches to CPU mode and back):
+    fifo_read [start] [count]       Read BRAM words (default: 0, 8)
+    fifo_write <addr> <hi> <lo>     Write 64-bit BRAM word (hex values, ctrl=0x00)
+    bram_write_full <a> <c> <h> <l> Write BRAM word with explicit ctrl byte (all hex)
+
+  Packet Routing:
+    packet_echo [dst_port_hex]      Capture->inspect->rewrite header->drain (echo packet)
+                                    dst_port: 01=MAC0, 04=MAC1, 10=MAC2, 40=MAC3
+                                    If omitted, echoes back to source port
+
+  CPU Control:
+    cpu_status                      Show CPU status (halted, running, cpsr, etc.)
+    cpu_reset                       Assert CPU reset (held in reset)
+    cpu_start                       Start CPU (also sets mode=CPU)
+    cpu_stop                        Stop CPU (held in reset)
+
+  CPU Memory:
+    cpu_load_imem <hex_file>        Load hex file into IMEM (resets CPU first)
+    cpu_read_imem [start] [count]   Read IMEM words (default: 0, 16)
+    cpu_read_dmem [start] [count]   Read DMEM words (default: 0, 8)
+    cpu_write_dmem <addr> <hi> <lo> Write 64-bit DMEM word (hex values)
+
+  CPU Debug:
+    cpu_la_read [start] [count]     Read logic analyzer (default: 0, 16)
+    cpu_test <hex_file>             Full CPU-FIFO test (load, write BRAM, run, verify)
+
+  GPU Control:
+    gpu_status                      Show GPU status (kernel_done, dma_busy, reset)
+    gpu_reset                       Assert GPU reset (held in reset)
+    gpu_start                       Release GPU reset (starts executing)
+    gpu_stop                        Stop GPU (held in reset)
+
+  GPU Memory:
+    gpu_load_imem <hex_file>        Load hex file into GPU IMEM (resets GPU first)
+    gpu_read_imem [start] [count]   Read GPU IMEM words (default: 0, 16)
+    gpu_read_dmem [start] [count]   Read GPU DMEM words (default: 0, 8)
+    gpu_write_dmem <addr> <hi> <lo> Write 64-bit GPU DMEM word (hex values)
+
+  DMA:
+    dma_fifo_to_gpu <f> <g> <len>   DMA FIFO BRAM[f..] -> GPU DMEM[g..] (len words)
+    dma_gpu_to_fifo <g> <f> <len>   DMA GPU DMEM[g..] -> FIFO BRAM[f..] (len words)
+
+  Integration Test:
+    gpu_test <hex_file>             Full GPU-DMA test (packet -> DMA -> kernel -> DMA -> drain)
+
+  NOTE: Base address is a placeholder (0x2001100). After first `make` on the
+        VM, grep include/registers.v for LAB8_BLOCK_ADDR and update $BASE.
+EOF
+}
+
+my $cmd = $ARGV[0] || "";
+
+if    ($cmd eq "reset")          { cmd_reset(); }
+elsif ($cmd eq "status")         { cmd_status(); }
+elsif ($cmd eq "mode")           { cmd_mode($ARGV[1]); }
+elsif ($cmd eq "drain")          { cmd_fifo_drain(); }
+elsif ($cmd eq "fifo_read")      { cmd_fifo_read($ARGV[1], $ARGV[2]); }
+elsif ($cmd eq "fifo_write")     { cmd_fifo_write($ARGV[1]+0, $ARGV[2], $ARGV[3]); }
+elsif ($cmd eq "bram_write_full"){ cmd_bram_write_full($ARGV[1]+0, $ARGV[2], $ARGV[3], $ARGV[4]); }
+elsif ($cmd eq "packet_echo")   { cmd_packet_echo($ARGV[1]); }
+elsif ($cmd eq "cpu_status")     { cmd_cpu_status(); }
+elsif ($cmd eq "cpu_reset")      { cmd_cpu_reset(); }
+elsif ($cmd eq "cpu_start")      { cmd_cpu_start(); }
+elsif ($cmd eq "cpu_stop")       { cmd_cpu_stop(); }
+elsif ($cmd eq "cpu_load_imem")  { cmd_cpu_load_imem($ARGV[1]); }
+elsif ($cmd eq "cpu_read_imem")  { cmd_cpu_read_imem($ARGV[1], $ARGV[2]); }
+elsif ($cmd eq "cpu_read_dmem")  { cmd_cpu_read_dmem($ARGV[1], $ARGV[2]); }
+elsif ($cmd eq "cpu_write_dmem") { cmd_cpu_write_dmem($ARGV[1]+0, $ARGV[2], $ARGV[3]); }
+elsif ($cmd eq "cpu_la_read")    { cmd_cpu_la_read($ARGV[1], $ARGV[2]); }
+elsif ($cmd eq "cpu_test")       { cmd_cpu_test($ARGV[1]); }
+elsif ($cmd eq "gpu_status")     { cmd_gpu_status(); }
+elsif ($cmd eq "gpu_reset")      { cmd_gpu_reset(); }
+elsif ($cmd eq "gpu_start")      { cmd_gpu_start(); }
+elsif ($cmd eq "gpu_stop")       { cmd_gpu_stop(); }
+elsif ($cmd eq "gpu_load_imem")  { cmd_gpu_load_imem($ARGV[1]); }
+elsif ($cmd eq "gpu_read_imem")  { cmd_gpu_read_imem($ARGV[1], $ARGV[2]); }
+elsif ($cmd eq "gpu_read_dmem")  { cmd_gpu_read_dmem($ARGV[1], $ARGV[2]); }
+elsif ($cmd eq "gpu_write_dmem") { cmd_gpu_write_dmem($ARGV[1]+0, $ARGV[2], $ARGV[3]); }
+elsif ($cmd eq "dma_fifo_to_gpu"){ cmd_dma_fifo_to_gpu($ARGV[1], $ARGV[2], $ARGV[3]); }
+elsif ($cmd eq "dma_gpu_to_fifo"){ cmd_dma_gpu_to_fifo($ARGV[1], $ARGV[2], $ARGV[3]); }
+elsif ($cmd eq "gpu_test")       { cmd_gpu_test($ARGV[1]); }
+else                             { usage(); }
