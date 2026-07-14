@@ -1,6 +1,11 @@
 `timescale 1ns / 1ps
 
 // data_mem.v -- MEM stage with dual-port DMEM + external FIFO BRAM access
+//
+// Address decode (addra = addr[7:0]):
+//   0x00-0x7F  internal DMEM (128 x 64-bit, shared across threads)
+//   0x80-0xEF  external FIFO BRAM window -> ext_mem_* port
+//   0xF0-0xFF  control-register alias window -> reg_alias_* port (Milestone 4)
 
 module data_mem(
     input         clk,
@@ -33,27 +38,55 @@ module data_mem(
     input  [7:0]  addrb,
     output reg [63:0] doutb,
 
-    // External memory (FIFO BRAM), active when addr[7]=1
+    // External memory (FIFO BRAM), active when addra[7]=1 && addra[7:4]!=4'hF
     output [7:0]  ext_mem_addr,
     output [63:0] ext_mem_din,
     output        ext_mem_we,
-    input  [63:0] ext_mem_dout
+    input  [63:0] ext_mem_dout,
+
+    // Register-alias window, active when addra[7:4]==4'hF (Milestone 4)
+    output [3:0]  reg_alias_sel,
+    output [63:0] reg_alias_wdata,
+    output        reg_alias_we,
+    input  [63:0] reg_alias_rdata
 );
 
     wire [7:0] addra = addr[7:0];
 
-    // addr[7] selects ext FIFO BRAM vs internal DMEM
-    wire addr_is_ext = addra[7];
+    // Address decode: 0xF0-0xFF carves out of the 0x80-0xFF FIFO window
+    wire addr_is_reg = (addra[7:4] == 4'hF);
+    wire addr_is_ext = addra[7] & ~addr_is_reg;
 
-    assign ext_mem_addr = {1'b0, addra[6:0]}; // CPU 128-255 -> FIFO 0-127
+    // External FIFO BRAM port
+    assign ext_mem_addr = {1'b0, addra[6:0]}; // CPU 0x80-0xEF -> FIFO 0x00-0x6F
     assign ext_mem_din  = dina;
     assign ext_mem_we   = WMemEn & addr_is_ext;
 
-    // Track previous-cycle external access for output mux
+    // Register-alias port
+    assign reg_alias_sel   = addra[3:0];
+    assign reg_alias_wdata = dina;
+    assign reg_alias_we    = WMemEn & addr_is_reg;
+
+    // Track previous-cycle access type for output mux
     reg was_ext;
+    reg was_reg;
     always @(posedge clk) begin
-        if (reset) was_ext <= 1'b0;
-        else       was_ext <= addr_is_ext;
+        if (reset) begin
+            was_ext <= 1'b0;
+            was_reg <= 1'b0;
+        end else begin
+            was_ext <= addr_is_ext;
+            was_reg <= addr_is_reg;
+        end
+    end
+
+    // reg_alias_rdata is combinational in the wrapper (mux from cpu_reg_sel).
+    // Capture it on the same edge that latches was_reg so the next cycle's
+    // unrelated cpu_reg_sel does not drive our was_reg-qualified douta.
+    reg [63:0] reg_alias_rdata_r;
+    always @(posedge clk) begin
+        if (reset) reg_alias_rdata_r <= 64'd0;
+        else       reg_alias_rdata_r <= reg_alias_rdata;
     end
 
     // 64-bit x 256 DMEM (shared across threads)
@@ -61,15 +94,16 @@ module data_mem(
 
     reg [63:0] dmem_rd;
 
-    // Port A: CPU (only writes internal when addr[7]=0)
+    // Port A: CPU writes only land in internal DMEM (addr 0x00-0x7F)
     always @(posedge clk) begin
-        if (WMemEn && !addr_is_ext)
+        if (WMemEn && !addr_is_ext && !addr_is_reg)
             mem[addra] <= dina;
         dmem_rd <= mem[addra];
     end
 
-    // Output mux: internal DMEM vs external FIFO BRAM
-    always @(*) douta = was_ext ? ext_mem_dout : dmem_rd;
+    // Output mux: alias rdata / external FIFO BRAM / internal DMEM
+    always @(*) douta = was_reg ? reg_alias_rdata_r
+                      : (was_ext ? ext_mem_dout : dmem_rd);
 
     // Port B: PCI
     always @(posedge clk) begin

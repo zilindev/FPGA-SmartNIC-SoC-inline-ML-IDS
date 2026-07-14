@@ -121,6 +121,13 @@ module lab8_wrapper
    wire [1:0]  cpu_thread_id;
    wire        cpu_all_halted;
 
+   // Register-alias window (Milestone 4): ARM DMEM addresses 0xF0..0xFF map
+   // to the wrapper's control registers via this combinational bus.
+   wire [3:0]  cpu_reg_sel;
+   wire [63:0] cpu_reg_wdata;
+   wire        cpu_reg_we;
+   reg  [63:0] cpu_reg_rdata;
+
    processor u_cpu (
       .clk            (clk),
       .rst            (cpu_reset),
@@ -137,6 +144,10 @@ module lab8_wrapper
       .ext_mem_din    (cpu_ext_mem_din),
       .ext_mem_we     (cpu_ext_mem_we),
       .ext_mem_dout   (cpu_ext_mem_dout),
+      .reg_alias_sel  (cpu_reg_sel),
+      .reg_alias_wdata(cpu_reg_wdata),
+      .reg_alias_we   (cpu_reg_we),
+      .reg_alias_rdata(cpu_reg_rdata),
       .la_rd_addr     (cpu_la_addr),
       .la_rd_data     (cpu_la_data),
       .dbg_cpsr_0     (cpu_cpsr_0),
@@ -316,13 +327,31 @@ module lab8_wrapper
    // --- FIFO proc port mux ---
    wire cpu_drives_proc = (reg_fifo_mode_r[1:0] == 2'd1) && cpu_running;
    wire dma_drives_proc = (reg_fifo_mode_r[1:0] == 2'd2) && dma_active;
+
+   // Fix B (§13.3): ARM writes to BRAM[0] must keep ctrl=0xFF so the
+   // outgoing NF2.1 header marker survives drain. All other ARM writes
+   // carry ctrl=0x00 (data word). cpu_ext_mem_addr[6:0] is the FIFO
+   // BRAM index; ARM DMEM 0x80 maps to FIFO 0x00.
+   //
+   // Semantically equivalent to the original ternary inline in the
+   // fifo_proc_din assignment, but pulled out to a named wire (2026-04-20
+   // second placement-roulette perturbation after the two-level alias mux
+   // improved but did not close timing; see docs/arm_orchestrator.md §13.3.1).
+   reg [7:0] arm_bram_wctrl;
+   always @(*) begin
+      if (cpu_ext_mem_addr[6:0] == 7'h00)
+         arm_bram_wctrl = 8'hFF;
+      else
+         arm_bram_wctrl = 8'h00;
+   end
+
    always @(*) begin
       fifo_mode        = reg_fifo_mode_r[1:0];
       fifo_drain_start = reg_fifo_drain[0];
 
       if (cpu_drives_proc) begin
          fifo_proc_addr = cpu_ext_mem_addr;
-         fifo_proc_din  = {8'h00, cpu_ext_mem_din};
+         fifo_proc_din  = {arm_bram_wctrl, cpu_ext_mem_din};
          fifo_proc_we   = cpu_ext_mem_we;
       end else if (dma_drives_proc) begin
          if (!dma_dir) begin
@@ -413,6 +442,51 @@ module lab8_wrapper
    wire [31:0] reg_gpu_imem_rdata  = gpu_imem_rd_data;
    wire [31:0] reg_gpu_dmem_rd_lo  = gpu_dmem_rd_data[31:0];
    wire [31:0] reg_gpu_dmem_rd_hi  = gpu_dmem_rd_data[63:32];
+
+   // --- ARM register-alias readback mux (Milestone 4) ---
+   // ARM DMEM addr 0xF0..0xFF -> cpu_reg_sel = addr[3:0]. Each slot exposes
+   // one wrapper control register. Slot map (RW unless noted):
+   //   0  DMA_CTRL          5  GPU_STATUS  (RO)
+   //   1  DMA_FIFO_ADDR     6  FIFO_STATUS (RO)
+   //   2  DMA_GPU_ADDR      7  FIFO_MODE
+   //   3  DMA_LENGTH        8  CTRL (soft-reset)
+   //   4  GPU_CTRL          9  GPU_CYCLE_COUNT (RO)
+   //                        A  FIFO_DRAIN (Fix B: on-chip response egress)
+   //
+   // Implementation: two-level mux tree. First level is two 8:1 muxes keyed on
+   // cpu_reg_sel[2:0] — one handles slots 0..7 (alias_rd_lo), the other 8..F
+   // (alias_rd_hi). Second level is a 2:1 final mux keyed on cpu_reg_sel[3].
+   // Semantically identical to a flat 16:1 case but gives XST a materially
+   // different netlist shape (needed after the 2026-04-20 flat-case synth hit
+   // TS_rx_clk/TS_tx_clk_gmii at 131/25 failing endpoints; see
+   // docs/arm_orchestrator.md §13.3.1).
+   reg [63:0] alias_rd_lo;
+   reg [63:0] alias_rd_hi;
+
+   always @(*) begin
+      case (cpu_reg_sel[2:0])
+         3'd0: alias_rd_lo = {32'd0, reg_dma_ctrl};
+         3'd1: alias_rd_lo = {32'd0, reg_dma_fifo_addr};
+         3'd2: alias_rd_lo = {32'd0, reg_dma_gpu_addr};
+         3'd3: alias_rd_lo = {32'd0, reg_dma_length};
+         3'd4: alias_rd_lo = {32'd0, reg_gpu_ctrl};
+         3'd5: alias_rd_lo = {32'd0, reg_gpu_status};
+         3'd6: alias_rd_lo = {32'd0, reg_status};
+         3'd7: alias_rd_lo = {32'd0, reg_fifo_mode_r};
+         default: alias_rd_lo = 64'd0;
+      endcase
+   end
+
+   always @(*) begin
+      case (cpu_reg_sel[2:0])
+         3'd0: alias_rd_hi = {32'd0, reg_ctrl};
+         3'd1: alias_rd_hi = {32'd0, reg_gpu_cycle_count};
+         3'd2: alias_rd_hi = {32'd0, reg_fifo_drain};
+         default: alias_rd_hi = 64'd0;
+      endcase
+   end
+
+   always @(*) cpu_reg_rdata = cpu_reg_sel[3] ? alias_rd_hi : alias_rd_lo;
 
    // --- Register ring state machine ---
 
@@ -578,6 +652,22 @@ module lab8_wrapper
                   default: ;
                endcase
             end
+         end else if (cpu_reg_we) begin
+            // ARM-side writes via the register-alias window (Milestone 4).
+            // PCI takes priority via the outer else-if; during the run phase
+            // PCI is idle, so ARM writes land here. Read-only slots (5/6/9)
+            // and reserved slots (B..F) silently drop writes.
+            case (cpu_reg_sel)
+               4'h0: reg_dma_ctrl       <= cpu_reg_wdata[31:0];
+               4'h1: reg_dma_fifo_addr  <= cpu_reg_wdata[31:0];
+               4'h2: reg_dma_gpu_addr   <= cpu_reg_wdata[31:0];
+               4'h3: reg_dma_length     <= cpu_reg_wdata[31:0];
+               4'h4: reg_gpu_ctrl       <= cpu_reg_wdata[31:0];
+               4'h7: reg_fifo_mode_r    <= cpu_reg_wdata[31:0];
+               4'h8: reg_ctrl           <= cpu_reg_wdata[31:0];
+               4'hA: reg_fifo_drain     <= cpu_reg_wdata[31:0];
+               default: ;
+            endcase
          end
 
          // Auto-clear strobes
@@ -588,6 +678,7 @@ module lab8_wrapper
          if (reg_gpu_imem_cmd[0])  reg_gpu_imem_cmd[0]  <= 1'b0;
          if (reg_gpu_dmem_cmd[0])  reg_gpu_dmem_cmd[0]  <= 1'b0;
          if (reg_dma_ctrl[0])      reg_dma_ctrl[0]      <= 1'b0;
+         if (reg_ctrl[0])          reg_ctrl[0]          <= 1'b0;
       end
    end
 

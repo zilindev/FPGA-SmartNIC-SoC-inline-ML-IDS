@@ -1,0 +1,605 @@
+// ARM IDS pipeline orchestrator -- milestone 3 refinement + Fix B (§13.3)
+// Source: docs/arm_orchestrator.md §8.2 (base) + §13.3 (egress extension)
+// Sim-verified: tb/tb_arm_ids_orchestrator.v (Fix A baseline: 6/6 PASS)
+//
+// Each iteration: wait for a packet, inference, rewrite Eth/IP/UDP headers
+// so the response egresses to the sender, drain, loop.
+//
+// Runtime layout:
+//   T0 runs the orchestrator loop at idx 0..116
+//   HALT tripwire at idx 117 (caught by B at idx 116 on every normal iteration)
+//   T1/T2/T3 entry stubs at idx 128/256/384 also HALT
+//   All other slots padded with HALT for safety against IMEM residue
+//
+// Dependencies:
+//   - BCAST IDS kernel loaded into GPU IMEM via PCI (ann_ids_11_16_8_2_bcast.hex)
+//   - Weights + biases loaded into GPU DMEM[11..127] via PCI
+//     (data_ids_11_16_8_2_bcast.hex; DMEM[0..10] overwritten per-packet by DMA)
+//   - lab8_wrapper register-alias window active (ARM DMEM 0xF0..0xFF)
+//     including Fix B alias slot 0xFA (reg_fifo_drain) and the BRAM[0]
+//     ctrl=0xFF force (so ARM header rewrites keep the NF2 header marker).
+//   - Inbound packet built with `send_ids.py --replicated` (11 DMEM-replicated
+//     feature words at BRAM[7..17]). See docs/arm_orchestrator.md §13 for the
+//     2026-04-18 layout-mismatch fix and §13.3 for the egress plan this
+//     program implements.
+//
+// Register allocation (single-thread; T0 only):
+//   r0 = 0xF0                            alias-window base pointer
+//   r1 = scratch (poll value, immediate)
+//   r3 = 0x80                            FIFO BRAM window base pointer
+//   r4, r5 = loaded BRAM words (b1/b2 or b4/b5 or header)
+//   r6, r7, r8 = intermediate shifted/masked values
+//   r9  = m_h32 = 0xFFFF_FFFF_0000_0000  (upper 32 bits mask)
+//   r10 = m_b01 = 0xFFFF_0000_0000_0000  (bytes 0..1 mask)
+//   r11 = m_b23 = 0x0000_FFFF_0000_0000  (bytes 2..3 mask)
+//   r12 = m_b45 = 0x0000_0000_FFFF_0000  (bytes 4..5 mask)
+//   r13 = m_b67 = 0x0000_0000_0000_FFFF  (bytes 6..7 mask)
+//   r14 = m_mid = 0x0000_FFFF_FFFF_0000  (bytes 2..5 mask; MAC-swap middle)
+//
+// Orchestrator flow (one iteration per input packet):
+//   wait_pkt      -> poll FIFO_STATUS bit[0] (pkt_ready)
+//   FIFO_MODE=2   -> hand Port B to DMA/GPU
+//   DMA in        -> FIFO[7..17] (11 replicated features) -> GPU DMEM[0..10]
+//   release GPU   -> GPU_CTRL=0
+//   wait kernel   -> poll GPU_STATUS bit[0] (kernel_done)
+//   hold GPU      -> GPU_CTRL=1
+//   DMA out       -> GPU DMEM[126..127] -> FIFO[7..8] (BF16 logits, 4x replicated)
+//   FIFO_MODE=1   -> hand Port B to ARM for header rewrites
+//   MAC swap      -> BRAM[1..2] Ethernet src/dst MAC
+//   IP+UDP swap   -> BRAM[4..5] IP src/dst + UDP src/dst ports
+//   UDP cksum=0   -> BRAM[6] (checksum no longer valid after header swap)
+//   NF2 hdr fix   -> BRAM[0] dst_port=0x0001 (MAC0), src_port=0x0002 (CPU0),
+//                    preserving word_length and byte_length from the inbound
+//                    packet. Wrapper forces ctrl=0xFF on this write.
+//   FIFO_MODE=0   -> return Port B to drain path
+//   FIFO_DRAIN=1  -> strobe reg_fifo_drain via alias slot 0xFA (auto-clear)
+//   wait_drain    -> poll FIFO_STATUS bit[0] until pkt_ready clears
+//   loop back to wait_pkt
+//
+// === idx 0..10: setup (runs once at T0 start) ===
+// MOV r0, #0xF0             alias base
+e3a000f0
+// MOV r3, #0x80             BRAM base
+e3a03080
+// MVN r13, #0               r13 = 0xFFFF_FFFF_FFFF_FFFF
+e3e0d000
+// MOV r13, r13, LSR #16     r13 = 0x0000_FFFF_FFFF_FFFF
+e1a0d82d
+// MOV r13, r13, LSR #16     r13 = 0x0000_0000_FFFF_FFFF
+e1a0d82d
+// MOV r13, r13, LSR #16     r13 = 0x0000_0000_0000_FFFF = m_b67
+e1a0d82d
+// MOV r12, r13, LSL #16     r12 = 0x0000_0000_FFFF_0000 = m_b45
+e1a0c80d
+// MOV r11, r12, LSL #16     r11 = 0x0000_FFFF_0000_0000 = m_b23
+e1a0b80c
+// MOV r10, r11, LSL #16     r10 = 0xFFFF_0000_0000_0000 = m_b01
+e1a0a80b
+// ORR r9, r10, r11          r9  = 0xFFFF_FFFF_0000_0000 = m_h32
+e18a900b
+// ORR r14, r11, r12         r14 = 0x0000_FFFF_FFFF_0000 = m_mid
+e18be00c
+// === idx 11..13: wait_pkt ===
+// LDR r1, [r0, #6]          FIFO_STATUS
+e5901006
+// TST r1, #1                pkt_ready?
+e3110001
+// BEQ wait_pkt              -> idx 11 (offset -4)
+0afffffc
+// === idx 14..15: FIFO_MODE = 2 ===
+// MOV r1, #2
+e3a01002
+// STR r1, [r0, #7]
+e5801007
+// === idx 16..23: DMA in (FIFO[7..17] -> GPU DMEM[0..10]) ===
+// MOV r1, #7
+e3a01007
+// STR r1, [r0, #1]          DMA_FIFO_ADDR
+e5801001
+// MOV r1, #0
+e3a01000
+// STR r1, [r0, #2]          DMA_GPU_ADDR
+e5801002
+// MOV r1, #11
+e3a0100b
+// STR r1, [r0, #3]          DMA_LENGTH
+e5801003
+// MOV r1, #1
+e3a01001
+// STR r1, [r0, #0]          DMA_CTRL start, dir=0
+e5801000
+// === idx 24..26: wait_dma_in ===
+// LDR r1, [r0, #5]          GPU_STATUS
+e5901005
+// TST r1, #2                dma_busy?
+e3110002
+// BNE wait_dma_in           -> idx 24 (offset -4)
+1afffffc
+// === idx 27..28: release GPU ===
+// MOV r1, #0
+e3a01000
+// STR r1, [r0, #4]          GPU_CTRL = 0
+e5801004
+// === idx 29..31: wait_kernel ===
+// LDR r1, [r0, #5]
+e5901005
+// TST r1, #1                kernel_done?
+e3110001
+// BEQ wait_kernel           -> idx 29 (offset -4)
+0afffffc
+// === idx 32..33: hold GPU ===
+// MOV r1, #1
+e3a01001
+// STR r1, [r0, #4]          GPU_CTRL = 1
+e5801004
+// === idx 34..41: DMA out (GPU DMEM[126..127] -> FIFO[7..8]) ===
+// MOV r1, #7                response payload lands at BRAM[7..8]
+e3a01007
+// STR r1, [r0, #1]          DMA_FIFO_ADDR
+e5801001
+// MOV r1, #126
+e3a0107e
+// STR r1, [r0, #2]          DMA_GPU_ADDR
+e5801002
+// MOV r1, #2
+e3a01002
+// STR r1, [r0, #3]          DMA_LENGTH = 2 (two BF16 logit words)
+e5801003
+// MOV r1, #3                start=1, dir=1 (GPU -> FIFO)
+e3a01003
+// STR r1, [r0, #0]
+e5801000
+// === idx 42..44: wait_dma_out ===
+// LDR r1, [r0, #5]
+e5901005
+// TST r1, #2
+e3110002
+// BNE wait_dma_out          -> idx 42 (offset -4)
+1afffffc
+// === idx 45..46: FIFO_MODE = 1 (hand Port B to ARM for header rewrites) ===
+// MOV r1, #1
+e3a01001
+// STR r1, [r0, #7]
+e5801007
+// === idx 47..65: MAC swap (BRAM[1..2]) ===
+// b1 bytes: Dst0 Dst1 Dst2 Dst3 Dst4 Dst5 Src0 Src1
+// b2 bytes: Src2 Src3 Src4 Src5 EtherType IPverIHL TOS
+// After swap:
+//   new_b1 = Src0 Src1 Src2 Src3 Src4 Src5 Dst0 Dst1
+//   new_b2 = Dst2 Dst3 Dst4 Dst5 EtherType IPverIHL TOS (unchanged bottom half)
+//
+// LDR r4, [r3, #1]          b1
+e5934001
+// LDR r5, [r3, #2]          b2
+e5935002
+// MOV r6, r4, LSL #16       b1 << 16
+e1a06804
+// MOV r6, r6, LSL #16       b1 << 32
+e1a06806
+// MOV r6, r6, LSL #16       b1 << 48 = [Src0 Src1 0 0 0 0 0 0]
+e1a06806
+// MOV r7, r5, LSR #16       b2 >> 16
+e1a07825
+// AND r7, r7, r14           & m_mid -> [0 0 Src2..5 0 0]
+e007700e
+// ORR r6, r6, r7
+e1866007
+// MOV r7, r4, LSR #16       b1 >> 16
+e1a07824
+// MOV r7, r7, LSR #16       b1 >> 32
+e1a07827
+// MOV r7, r7, LSR #16       b1 >> 48 = [0 0 0 0 0 0 Dst0 Dst1]
+e1a07827
+// ORR r6, r6, r7            r6 = new_b1
+e1866007
+// STR r6, [r3, #1]
+e5836001
+// MOV r7, r4, LSL #16       b1 << 16 = [Dst2..5 Src0 Src1 0 0]
+e1a07804
+// AND r7, r7, r9            & m_h32 -> [Dst2..5 0 0 0 0]
+e0077009
+// MVN r8, r9                r8 = ~m_h32 = m_l32 = 0x0000_0000_FFFF_FFFF
+e1e08009
+// AND r8, r5, r8            b2 & m_l32 = [0 0 0 0 EtherType IPverIHL TOS]
+e0058008
+// ORR r7, r7, r8            r7 = new_b2
+e1877008
+// STR r7, [r3, #2]
+e5837002
+// === idx 66..93: IP + UDP swap (BRAM[4..5]) ===
+// b4 bytes: IPck0 IPck1 SrcIP0 SrcIP1 SrcIP2 SrcIP3 DstIP0 DstIP1
+// b5 bytes: DstIP2 DstIP3 UDPsrc0 UDPsrc1 UDPdst0 UDPdst1 UDPlen0 UDPlen1
+// After swap:
+//   new_b4 = IPck0 IPck1 DstIP0 DstIP1 DstIP2 DstIP3 SrcIP0 SrcIP1
+//   new_b5 = SrcIP2 SrcIP3 UDPdst0 UDPdst1 UDPsrc0 UDPsrc1 UDPlen0 UDPlen1
+// IP checksum unchanged (bytes 0..1 of b4) -- swapping src/dst doesn't change
+// the 16-bit one's-complement sum.
+//
+// LDR r4, [r3, #4]          b4
+e5934004
+// LDR r5, [r3, #5]          b5
+e5935005
+// -- new_b4: build 4 pieces then OR --
+// AND r6, r4, r10           bytes 0..1 = IPck (unchanged)
+e004600a
+// MOV r7, r4, LSL #16
+e1a07804
+// MOV r7, r7, LSL #16       b4 << 32 = [SrcIP2 SrcIP3 DstIP0 DstIP1 0 0 0 0]
+e1a07807
+// AND r7, r7, r11           & m_b23 -> [0 0 DstIP0 DstIP1 0 0 0 0]
+e007700b
+// ORR r6, r6, r7
+e1866007
+// MOV r7, r5, LSR #16
+e1a07825
+// MOV r7, r7, LSR #16       b5 >> 32 = [0 0 0 0 DstIP2 DstIP3 UDPsrc0 UDPsrc1]
+e1a07827
+// AND r7, r7, r12           & m_b45 -> [0 0 0 0 DstIP2 DstIP3 0 0]
+e007700c
+// ORR r6, r6, r7
+e1866007
+// MOV r7, r4, LSR #16
+e1a07824
+// MOV r7, r7, LSR #16       b4 >> 32 = [0 0 0 0 IPck0 IPck1 SrcIP0 SrcIP1]
+e1a07827
+// AND r7, r7, r13           & m_b67 -> [0 0 0 0 0 0 SrcIP0 SrcIP1]
+e007700d
+// ORR r6, r6, r7            r6 = new_b4
+e1866007
+// STR r6, [r3, #4]
+e5836004
+// -- new_b5: build 4 pieces then OR --
+// MOV r7, r4, LSL #16
+e1a07804
+// MOV r7, r7, LSL #16       b4 << 32 = [SrcIP2 SrcIP3 DstIP0 DstIP1 0 0 0 0]
+e1a07807
+// AND r7, r7, r10           & m_b01 -> [SrcIP2 SrcIP3 0 0 0 0 0 0]
+e007700a
+// MOV r8, r5, LSL #16       b5 << 16 = [UDPsrc UDPdst UDPlen 0]
+e1a08805
+// AND r8, r8, r11           & m_b23 -> [0 0 UDPdst0 UDPdst1 0 0 0 0]
+e008800b
+// ORR r7, r7, r8
+e1877008
+// MOV r8, r5, LSR #16       b5 >> 16 = [0 0 DstIP2 DstIP3 UDPsrc UDPdst]
+e1a08825
+// AND r8, r8, r12           & m_b45 -> [0 0 0 0 UDPsrc0 UDPsrc1 0 0]
+e008800c
+// ORR r7, r7, r8
+e1877008
+// AND r8, r5, r13           b5 & m_b67 -> [0 0 0 0 0 0 UDPlen0 UDPlen1]
+e005800d
+// ORR r7, r7, r8            r7 = new_b5
+e1877008
+// STR r7, [r3, #5]
+e5837005
+// === idx 94..95: zero UDP checksum at BRAM[6] ===
+// MOV r1, #0
+e3a01000
+// STR r1, [r3, #6]
+e5831006
+// === idx 96..108: NF2.1 header fixup at BRAM[0] ===
+// dst_port=0x0001 (MAC0), src_port=0x0002 (CPU0), preserve word_length and
+// byte_length. Wrapper forces ctrl=0xFF on this write (Fix B RTL change).
+//
+// LDR r4, [r3, #0]          header
+e5934000
+// AND r5, r4, r11           word_length (bytes 2..3)
+e004500b
+// AND r6, r4, r13           byte_length (bytes 6..7)
+e004600d
+// MOV r7, #1                dst_port = 1
+e3a07001
+// MOV r7, r7, LSL #16
+e1a07807
+// MOV r7, r7, LSL #16
+e1a07807
+// MOV r7, r7, LSL #16       r7 = 0x0001_0000_0000_0000 (bytes 0..1 = 0x0001)
+e1a07807
+// MOV r8, #2                src_port = 2
+e3a08002
+// MOV r8, r8, LSL #16       r8 = 0x0000_0000_0002_0000 (bytes 4..5 = 0x0002)
+e1a08808
+// ORR r7, r7, r5            r7 |= word_length
+e1877005
+// ORR r7, r7, r8            r7 |= src_port
+e1877008
+// ORR r7, r7, r6            r7 |= byte_length
+e1877006
+// STR r7, [r3, #0]          new header (ctrl=0xFF forced by wrapper)
+e5837000
+// === idx 109..110: FIFO_MODE = 0 ===
+// MOV r1, #0
+e3a01000
+// STR r1, [r0, #7]
+e5801007
+// === idx 111..112: FIFO_DRAIN = 1 (alias slot 0xFA; auto-clears) ===
+// MOV r1, #1
+e3a01001
+// STR r1, [r0, #10]         FIFO_DRAIN alias
+e580100a
+// === idx 113..115: wait_drain ===
+// LDR r1, [r0, #6]          FIFO_STATUS
+e5901006
+// TST r1, #1                pkt_ready still set?
+e3110001
+// BNE wait_drain            -> idx 113 (offset -4)
+1afffffc
+// === idx 116: loop back to wait_pkt ===
+// B wait_pkt                -> idx 11 (offset -107 = 0xFFFF95)
+eaffff95
+// === idx 117: T0 overshoot tripwire ===
+ffffffff
+// === idx 118..127: HALT filler ===
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+// === idx 128: T1 entry (HALT) ===
+ffffffff
+// === idx 129..255: HALT filler (T1 region continues halting) ===
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+// === idx 256: T2 entry (HALT) ===
+ffffffff
+// === idx 257..383: HALT filler (T2 region) ===
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+ffffffff
+// === idx 384: T3 entry (HALT) ===
+ffffffff

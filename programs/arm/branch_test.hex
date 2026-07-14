@@ -1,0 +1,22 @@
+// Minimal conditional branch test
+// Tests BLE (should be taken) and BEQ (should NOT be taken)
+// After CMP r3, #9 where r3=5: CPSR = {N=1, Z=0, C=0, V=0}
+//
+// Expected: DMEM[0] = 0x42 (BLE taken), DMEM[4] = 0x11 (BEQ not taken)
+// If fail:  DMEM[0] = 0xFF (BLE not taken), DMEM[4] = 0x99 (BEQ taken)
+//
+e3a03005
+e3530009
+da000002
+e3a040ff
+e5804000
+ea000001
+e3a04042
+e5804000
+0a000002
+e3a05011
+e5805004
+ea000001
+e3a05099
+e5805004
+eafffffe

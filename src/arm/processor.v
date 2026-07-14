@@ -26,6 +26,12 @@ module processor(
     output        ext_mem_we,
     input  [63:0] ext_mem_dout,
 
+    // Register-alias window (Milestone 4: ARM-orchestrated IDS pipeline)
+    output [3:0]  reg_alias_sel,
+    output [63:0] reg_alias_wdata,
+    output        reg_alias_we,
+    input  [63:0] reg_alias_rdata,
+
     // Logic Analyzer read port
     input  [10:0] la_rd_addr,
     output [63:0] la_rd_data,
@@ -358,7 +364,11 @@ data_mem u_mem(
     .ext_mem_addr(ext_mem_addr),
     .ext_mem_din(ext_mem_din),
     .ext_mem_we(ext_mem_we),
-    .ext_mem_dout(ext_mem_dout)
+    .ext_mem_dout(ext_mem_dout),
+    .reg_alias_sel(reg_alias_sel),
+    .reg_alias_wdata(reg_alias_wdata),
+    .reg_alias_we(reg_alias_we),
+    .reg_alias_rdata(reg_alias_rdata)
 );
 
 // --- WB Stage ---

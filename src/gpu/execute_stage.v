@@ -1,4 +1,4 @@
-// execute_stage.v — SIMD ALU (2-cycle) | FMA (3-cycle) | LD/ST path
+// execute_stage.v — SIMD ALU (3-cycle) | FMA (3-cycle) | LD/ST path
 `timescale 1ns / 1ps
 `include "gpu_params.vh"
 
@@ -28,7 +28,7 @@ module execute_stage (
     // EX1: Operand B MUX
     wire [`DATA_WIDTH-1:0] op_b = use_imm ? imm_ext : rs2_data;
 
-    // SIMD ALU (2-cycle pipelined)
+    // SIMD ALU (3-cycle pipelined: input reg -> bf16 EX1 -> bf16 EX2 -> output)
     wire [`DATA_WIDTH-1:0] simd_result;
 
     simd_alu u_simd_alu (
@@ -79,12 +79,12 @@ module execute_stage (
         end
     end
 
-    // EX2 -> EX3 pipeline register (aligns SIMD with 3-cycle FMA)
+    // EX2 -> EX3 pipeline register (aligns FMA/mem path; simd_alu now
+    // produces simd_result directly in EX3, so no simd_result_r needed)
     reg                      is_fma_r2;
     reg                      mem_write_r2;
     reg [`DATA_WIDTH-1:0]    rs2_data_r2;
     reg [`DMEM_ADDR_W-1:0]   mem_addr_r2;
-    reg [`DATA_WIDTH-1:0]    simd_result_r;
 
     always @(posedge clk) begin
         if (rst) begin
@@ -92,18 +92,16 @@ module execute_stage (
             mem_write_r2 <= 1'b0;
             rs2_data_r2  <= {`DATA_WIDTH{1'b0}};
             mem_addr_r2  <= {`DMEM_ADDR_W{1'b0}};
-            simd_result_r <= {`DATA_WIDTH{1'b0}};
         end else begin
             is_fma_r2    <= is_fma_r;
             mem_write_r2 <= mem_write_r;
             rs2_data_r2  <= rs2_data_r;
             mem_addr_r2  <= mem_addr_r;
-            simd_result_r <= simd_result;
         end
     end
 
     // EX3: Result MUX
-    assign result = is_fma_r2 ? fma_result : simd_result_r;
+    assign result = is_fma_r2 ? fma_result : simd_result;
 
     // EX3: DMEM interface
     assign dmem_addr    = mem_addr_r2;
